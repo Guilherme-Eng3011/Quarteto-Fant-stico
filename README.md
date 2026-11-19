@@ -10,10 +10,10 @@
 
 | Nome | Matrícula | Usuário do GitHub |
 | --- | --- | --- |
-|  |  |  |
-|  |  |  |
-|  |  |  |
-|  |  |  |
+| Guilherme Victor | 2410265 | Guilherme-Eng3011 |
+| Divino Filho | 2409798 | DSanches1206 |
+| Leonardo Aranha  | 2410873 | Leonardoaco  |
+| Lucas de Lucena | 2408620 | linkas77 |
 |  |  |  |
 
 ## O cenário
