@@ -1,209 +1,152 @@
-import pandas as pd
-import psycopg2
-from datetime import datetime, timedelta
 
-# ── Configurações ──────────────────────────────────────────
-ARQUIVO = "dados/base_teste.xlsx"  #trocar caminho do dataset dos Senhores
+
+import os
+from pathlib import Path
+import pandas as pd
+import mysql.connector
+
+ARQUIVO = Path(os.getenv("ARQUIVO_XLSX", "dados/base_teste.xlsx"))
 DB = {
-    "host": "localhost", #de acordo com o host do SGBD dos Senhores
-    "port": 5432,  #porta padrão do PostgreSQL a do MySQL 3006
-    "database": "postgres", #nome da data base do Senhores
-    "user": "postgres",   #utilizador dos senhores 
-    "password": "1234"   #senha do utilizador
+    "host": os.getenv("MYSQL_HOST", "localhost"),
+    "port": int(os.getenv("MYSQL_PORT", "3306")),
+    "database": os.getenv("MYSQL_DATABASE", "integracao_dados_entrega"),
+    "user": os.getenv("MYSQL_USER", "root"),
+    "password": os.getenv("MYSQL_PASSWORD", ""),
 }
 
-# ── Converte serial do Excel para data ─────────────────────
-def excel_para_data(valor):
-    try:
-        if pd.isna(valor):
-            return None
-        return (datetime(1899, 12, 30) + timedelta(days=int(valor))).date()
-    except:
+
+def valor(v):
+    """Converte NaN/NaT para None e tipos numpy para tipos Python."""
+    if pd.isna(v):
         return None
-
-# ── Conecta no banco ───────────────────────────────────────
-print("Conectando no PostgreSQL...")
-conn = psycopg2.connect(**DB)
-cur = conn.cursor()
-print("Conectado!\n")
-
+    if hasattr(v, "to_pydatetime"):
+        return v.to_pydatetime().date()
+    if hasattr(v, "item"):
+        return v.item()
+    return v
 
 
-# 1. FORNECEDOR
+def texto(v):
+    v = valor(v)
+    return None if v is None else str(v).strip()
 
-print("Importando fornecedor...")
-df = pd.read_excel(ARQUIVO, sheet_name="fornecedor")
-df.columns = df.columns.str.strip()
 
-for _, row in df.iterrows():
+def data(v):
+    v = valor(v)
+    return None if v is None else pd.Timestamp(v).date()
+
+
+def num(v, default=None):
+    v = valor(v)
+    return default if v is None else float(v)
+
+
+def inteiro(v, default=None):
+    v = valor(v)
+    return default if v is None else int(v)
+
+
+def importar(cursor, tabela, sql, linhas):
+    total = 0
+    for n, dados in enumerate(linhas, start=1):
+        try:
+            cursor.execute(sql, dados)
+            total += cursor.rowcount if cursor.rowcount > 0 else 0
+        except Exception as exc:
+            raise RuntimeError(f"Erro na tabela {tabela}, registro {n}: {exc}") from exc
+    print(f"{tabela}: {total} inserções novas (linhas processadas: {n if 'n' in locals() else 0})")
+
+
+def main():
+    if not ARQUIVO.exists():
+        raise FileNotFoundError(f"Planilha não encontrada: {ARQUIVO.resolve()}")
+    xls = pd.ExcelFile(ARQUIVO)
+    esperadas = {"venda", "pedido_compra", "entradas_mercadoria", "produtos_filial", "fornecedor"}
+    if not esperadas.issubset(set(xls.sheet_names)):
+        raise ValueError(f"Abas ausentes: {esperadas - set(xls.sheet_names)}")
+
+    conn = mysql.connector.connect(**DB)
     try:
-        cur.execute("""
-            INSERT INTO public.fornecedor (idfornecedor, razao_social)
-            VALUES (%s, %s)
-            ON CONFLICT (idfornecedor) DO NOTHING
-        """, (
-            str(row["idfornecedor"]).strip(),
-            str(row["razao_social"]).strip()
-        ))
-    except Exception as e:
-        print(f"  Erro fornecedor: {e}")
+        cur = conn.cursor()
+   
+        df = pd.read_excel(ARQUIVO, sheet_name="fornecedor")
+        df.columns = df.columns.astype(str).str.strip()
+        importar(cur, "fornecedor",
+            "INSERT IGNORE INTO fornecedor (idfornecedor, razao_social) VALUES (%s,%s)",
+            [(texto(r.idfornecedor), texto(r.razao_social)) for r in df.itertuples(index=False)])
+        conn.commit()
+
+       
+        df = pd.read_excel(ARQUIVO, sheet_name="produtos_filial")
+        df.columns = df.columns.astype(str).str.strip()
+        importar(cur, "produtos_filial",
+            "INSERT IGNORE INTO produtos_filial "
+            "(filial_id,produto_id,descricao,estoque,preco_unitario,preco_compra,preco_venda,idfornecedor) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+            [(inteiro(r.filial_id), texto(r.idproduto), texto(r.descricao), num(r.estoque,0),
+              num(r.preco_unitario,0), num(r.preco_compra,0), num(r.preco_venda,0), texto(r.idfornecedor))
+             for r in df.itertuples(index=False)])
+        conn.commit()
+
+        df_full = pd.read_excel(ARQUIVO, sheet_name="pedido_compra")
+        extras = [c for c in df_full.columns if str(c).startswith("Unnamed:")]
+        if extras and df_full[extras].notna().any().any():
+            print("AVISO: pedido_compra contém bloco adicional sem cabeçalhos:", extras)
+            print("       Essas células foram preservadas na planilha original e não importadas como campos válidos.")
+        df = df_full.iloc[:, :12].copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        linhas = []
+        for r in df.itertuples(index=False):
+            pendente = None if valor(r.qtde_pedida) is None else num(r.qtde_pedida,0) - num(r.qtde_entregue,0)
+            fornecedor = texto(r.fornecedor_id)
+            # IDs numéricos da planilha são associados aos códigos F1...F20.
+            fornecedor = f"F{int(float(fornecedor))}" if fornecedor not in (None, "") else None
+            linhas.append((inteiro(r.pedido_id), data(r.data_pedido), inteiro(r.item,0),
+                texto(r.produto_id), texto(r.descricao_produto), inteiro(r.ordem_compra,0),
+                num(r.qtde_pedida), inteiro(r.filial_id), data(r.data_entrega),
+                num(r.qtde_entregue,0), pendente, num(r.preco_compra,0), fornecedor))
+        importar(cur, "pedido_compra",
+            "INSERT IGNORE INTO pedido_compra "
+            "(pedido_id,data_pedido,item,produto_id,descricao_produto,ordem_compra,qtde_pedida,filial_id,"
+            "data_entrega,qtde_entregue,qtde_pendente,preco_compra,fornecedor_id) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", linhas)
+        conn.commit()
+
+        df = pd.read_excel(ARQUIVO, sheet_name="entradas_mercadoria")
+        df.columns = df.columns.astype(str).str.strip()
+        importar(cur, "entradas_mercadoria",
+            "INSERT IGNORE INTO entradas_mercadoria "
+            "(ordem_compra,data_entrada,nro_nfe,item,produto_id,descricao_produto,qtde_recebida,filial_id,custo_unitario) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            [(inteiro(r.ordem_compra), data(r.data_entrada), texto(r.nro_nfe), inteiro(r.item,0),
+              texto(r.produto_id), texto(r.descricao_produto), num(r.qtde_recebida),
+              inteiro(r.filial_id), num(r.custo_unitario,0)) for r in df.itertuples(index=False)])
+        conn.commit()
+
+  
+        df = pd.read_excel(ARQUIVO, sheet_name="venda")
+        df.columns = df.columns.astype(str).str.strip()
+        importar(cur, "venda",
+            "INSERT IGNORE INTO venda "
+            "(venda_id,data_emissao,horariomov,produto_id,qtde_vendida,valor_unitario,filial_id,item,unidade_medida) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            [(inteiro(r.venda_id), data(r.data_emissao), texto(r.horariomov) or "00:00:00",
+              texto(r.produto_id), num(r.qtde_vendida), num(r.valor_unitario,0),
+              inteiro(r.filial_id,1), inteiro(r.item,0), texto(r.unidade_medida))
+             for r in df.itertuples(index=False)])
+        conn.commit()
+
+        print("\nContagem final no MySQL:")
+        for tabela in ["fornecedor", "produtos_filial", "pedido_compra", "entradas_mercadoria", "venda"]:
+            cur.execute(f"SELECT COUNT(*) FROM {tabela}")
+            print(f"  {tabela}: {cur.fetchone()[0]}")
+        cur.close()
+    except Exception:
         conn.rollback()
-        continue
-
-conn.commit()
-print(f"  {len(df)} registros inseridos em fornecedor \n")
-
-
-# 2. PRODUTOS_FILIAL
-
-print("Importando produtos_filial...")
-df = pd.read_excel(ARQUIVO, sheet_name="produtos_filial")
-df.columns = df.columns.str.strip()
-
-for _, row in df.iterrows():
-    try:
-        cur.execute("""
-            INSERT INTO public.produtos_filial
-                (filial_id, produto_id, descricao, estoque,
-                 preco_unitario, preco_compra, preco_venda, idfornecedor)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (filial_id, produto_id) DO NOTHING
-        """, (
-            int(row["filial_id"]) if pd.notna(row["filial_id"]) else None,
-            str(row["idproduto"]).strip(),
-            str(row["descricao"]).strip(),
-            float(row["estoque"]) if pd.notna(row["estoque"]) else 0,
-            float(row["preco_unitario"]) if pd.notna(row["preco_unitario"]) else 0,
-            float(row["preco_compra"]) if pd.notna(row["preco_compra"]) else 0,
-            float(row["preco_venda"]) if pd.notna(row["preco_venda"]) else 0,
-            str(row["idfornecedor"]).strip() if pd.notna(row["idfornecedor"]) else None
-        ))
-    except Exception as e:
-        print(f"  Erro produtos_filial linha {_}: {e}")
-        conn.rollback()
-        continue
-
-conn.commit()
-print(f"  {len(df)} registros inseridos em produtos_filial \n")
+        raise
+    finally:
+        conn.close()
 
 
-# 3. PEDIDO_COMPRA
-
-print("Importando pedido_compra...")
-df = pd.read_excel(ARQUIVO, sheet_name="pedido_compra")
-df.columns = df.columns.str.strip()
-
-df = df.iloc[:, :12]
-df.columns = ["pedido_id","data_pedido","item","produto_id","descricao_produto",
-              "ordem_compra","qtde_pedida","filial_id","data_entrega",
-              "qtde_entregue","preco_compra","fornecedor_id"]
-
-inseridos = 0
-for _, row in df.iterrows():
-    try:
-        cur.execute("""
-            INSERT INTO public.pedido_compra
-                (pedido_id, data_pedido, item, produto_id, descricao_produto,
-                 ordem_compra, qtde_pedida, filial_id, data_entrega,
-                 qtde_entregue, qtde_pendente, preco_compra, fornecedor_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (pedido_id, produto_id, item) DO NOTHING
-        """, (
-            float(row["pedido_id"]),
-            excel_para_data(row["data_pedido"]),
-            float(row["item"]),
-            str(row["produto_id"]).strip(),
-            str(row["descricao_produto"]).strip() if pd.notna(row["descricao_produto"]) else None,
-            float(row["ordem_compra"]) if pd.notna(row["ordem_compra"]) else 0,
-            float(row["qtde_pedida"]) if pd.notna(row["qtde_pedida"]) else None,
-            int(row["filial_id"]) if pd.notna(row["filial_id"]) else None,
-            excel_para_data(row["data_entrega"]),
-            float(row["qtde_entregue"]) if pd.notna(row["qtde_entregue"]) else 0,
-            float(row["qtde_pedida"]) - float(row["qtde_entregue"])
-                if pd.notna(row["qtde_pedida"]) and pd.notna(row["qtde_entregue"]) else 0,
-            float(row["preco_compra"]) if pd.notna(row["preco_compra"]) else 0,
-            int(row["fornecedor_id"]) if pd.notna(row["fornecedor_id"]) else None
-        ))
-        inseridos += 1
-    except Exception as e:
-        print(f"  Erro pedido_compra linha {_}: {e}")
-        conn.rollback()
-        continue
-
-conn.commit()
-print(f"  {inseridos} registros inseridos em pedido_compra \n")
-
-
-# 4. ENTRADAS_MERCADORIA
-
-print("Importando entradas_mercadoria...")
-df = pd.read_excel(ARQUIVO, sheet_name="entradas_mercadoria")
-df.columns = df.columns.str.strip()
-
-for _, row in df.iterrows():
-    try:
-        cur.execute("""
-            INSERT INTO public.entradas_mercadoria
-                (data_entrada, nro_nfe, item, produto_id, descricao_produto,
-                 ordem_compra, qtde_recebida, filial_id, custo_unitario)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (ordem_compra, item, produto_id, nro_nfe) DO NOTHING
-        """, (
-            excel_para_data(row["data_entrada"]),
-            str(row["nro_nfe"]).strip(),
-            float(row["item"]),
-            str(row["produto_id"]).strip(),
-            str(row["descricao_produto"]).strip() if pd.notna(row["descricao_produto"]) else None,
-            float(row["ordem_compra"]) if pd.notna(row["ordem_compra"]) else 0,
-            float(row["qtde_recebida"]) if pd.notna(row["qtde_recebida"]) else None,
-            int(row["filial_id"]) if pd.notna(row["filial_id"]) else None,
-            float(row["custo_unitario"]) if pd.notna(row["custo_unitario"]) else 0
-        ))
-    except Exception as e:
-        print(f"  Erro entradas_mercadoria linha {_}: {e}")
-        conn.rollback()
-        continue
-
-conn.commit()
-print(f"  {len(df)} registros inseridos em entradas_mercadoria \n")
-
-
-# 5. VENDA
-
-print("Importando venda...")
-df = pd.read_excel(ARQUIVO, sheet_name="venda")
-df.columns = df.columns.str.strip()
-
-for _, row in df.iterrows():
-    try:
-        cur.execute("""
-            INSERT INTO public.venda
-                (venda_id, data_emissao, horariomov, produto_id,
-                 qtde_vendida, valor_unitario, filial_id, item, unidade_medida)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (filial_id, venda_id, data_emissao, produto_id, item, horariomov) DO NOTHING
-        """, (
-            int(row["venda_id"]),
-            excel_para_data(row["data_emissao"]),
-            str(row["horariomov"]).strip() if pd.notna(row["horariomov"]) else "00:00:00",
-            str(row["produto_id"]).strip(),
-            float(row["qtde_vendida"]) if pd.notna(row["qtde_vendida"]) else None,
-            float(row["valor_unitario"]) if pd.notna(row["valor_unitario"]) else 0,
-            int(row["filial_id"]) if pd.notna(row["filial_id"]) else 1,
-            int(row["item"]) if pd.notna(row["item"]) else 0,
-            str(row["unidade_medida"]).strip() if pd.notna(row["unidade_medida"]) else None
-        ))
-    except Exception as e:
-        print(f"  Erro venda linha {_}: {e}")
-        conn.rollback()
-        continue
-
-conn.commit()
-print(f"  {len(df)} registros inseridos em venda \n")
-
-
-cur.close()
-conn.close()
-print("=" * 40)
-print("Importação concluída com sucesso! ")
-print("=" * 40)
+if __name__ == "__main__":
+    main()
