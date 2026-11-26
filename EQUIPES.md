@@ -4,4 +4,4 @@ Lista das equipes, montada a partir dos forks. Cada equipe preenche o nome do ti
 
 | Time | Integrantes (usuário do GitHub) | Fork |
 | --- | --- | --- |
-| Quarteto fantastico | Guilherme Victor (Dono do fork), Divino Filho , Leonardo Aranha , Lucas de Lucena | [Guilherme301105/bd-integracao-dados-engco241m01] (https://github.com/Guilherme301105/bd-integracao-dados-engco241m01) |
+| Quarteto fantastico | Guilherme Victor (Dono do fork), Divino Filho , Leonardo Aranha , Lucas de Lucena | [Guilherme301105/bd-integracao-dados-engco241m01] (https://github.com/Guilherme-Eng3011/Quarteto-Fant-stico) |
